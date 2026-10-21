@@ -7,6 +7,7 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ServiceInfo;
 import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
 import android.media.MediaCodec;
@@ -87,10 +88,13 @@ public class ScreenSharingService extends Service {
         Log.d(Const.LOG_TAG, "ScreenSharingService created");
         mPacketizer = new H264Packetizer();
         mProjectionManager = (MediaProjectionManager)getSystemService(Context.MEDIA_PROJECTION_SERVICE);
-        // NOT startAsForeground() here: when targeting API 34+, starting a
-        // foreground service of type mediaProjection before the user has granted
-        // screen-capture consent throws SecurityException. We become foreground in
-        // startSharing(), immediately after getMediaProjection() returns a token.
+        // We do NOT become foreground here: only the ACTION_START_SHARING command
+        // needs the mediaProjection foreground-service type, and it becomes
+        // foreground at the top of startSharing() -- BEFORE getMediaProjection(),
+        // which on API 34 throws SecurityException unless the mediaProjection FGS
+        // is already running. (Verified on the target device: the contrary order
+        // crashes with "Media projections require a foreground service of type
+        // ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION".)
     }
 
     private void startAsForeground() {
@@ -117,7 +121,16 @@ public class ScreenSharingService extends Service {
                 .setContentIntent(pendingIntent)
                 .setSmallIcon(R.drawable.ic_notification).build();
 
-        startForeground(NOTIFICATION_ID, notification);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // Pass the type explicitly: API 34 enforces, at getMediaProjection()
+            // time, that this service is already a foreground service of type
+            // mediaProjection. The manifest declares the type; passing it
+            // explicitly here is the form guaranteed to register it.
+            startForeground(NOTIFICATION_ID, notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+        } else {
+            startForeground(NOTIFICATION_ID, notification);
+        }
     }
 
     @Override
@@ -213,13 +226,27 @@ public class ScreenSharingService extends Service {
     }
 
     private void startSharing(int resultCode, Intent data) {
-        mMediaProjection = mProjectionManager.getMediaProjection(resultCode, data);
+        // Android 14 (API 34) requires the mediaProjection foreground service to
+        // be running BEFORE getMediaProjection() is called; otherwise the system
+        // throws SecurityException. Become foreground first, then take the token.
+        startAsForeground();
+        try {
+            mMediaProjection = mProjectionManager.getMediaProjection(resultCode, data);
+        } catch (SecurityException e) {
+            // Defensive: never crash-loop over a consent/FGS edge case.
+            Log.e(Const.LOG_TAG, "ScreenSharingService: getMediaProjection failed", e);
+            LocalBroadcastManager.getInstance(this).sendBroadcast(new Intent(Const.ACTION_SCREEN_SHARING_FAILED));
+            stopForeground(true);
+            stopSelf();
+            return;
+        }
         if (mMediaProjection == null) {
             // Consent was revoked/expired between the dialog and this command.
             // Must not continue: we were started with startForegroundService() and
             // would otherwise trip the "did not call startForeground()" watchdog.
             Log.e(Const.LOG_TAG, "ScreenSharingService: getMediaProjection returned null");
             LocalBroadcastManager.getInstance(this).sendBroadcast(new Intent(Const.ACTION_SCREEN_SHARING_FAILED));
+            stopForeground(true);
             stopSelf();
             return;
         }
@@ -232,9 +259,6 @@ public class ScreenSharingService extends Service {
             }
         };
         mMediaProjection.registerCallback(mMediaProjectionCallback, null);
-        // Foreground only now: the API 34 mediaProjection type requires a granted
-        // projection token, which we hold as of the line above.
-        startAsForeground();
         mVirtualDisplay = createVirtualDisplay();
         mMediaCodec.start();
         startSending();
