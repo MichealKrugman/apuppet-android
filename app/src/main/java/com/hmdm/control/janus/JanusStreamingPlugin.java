@@ -60,6 +60,14 @@ public class JanusStreamingPlugin extends JanusPlugin {
         body.setVideobufferkf(false);
         createRequest.setBody(body);
 
+        // The mountpoint id equals the (now stable, per-install) room id, so a
+        // leftover mountpoint from a previous session can still exist in Janus
+        // memory. Creating would fail with "A stream with the provided ID already
+        // exists", and we need Janus to assign us fresh RTP ports anyway. Destroy
+        // any stale mountpoint first; best-effort, ignore the result (it may not
+        // exist).
+        destroyIfExists();
+
         Response<JanusStreamingCreateResponse> response = ServerApiHelper.execute(apiInstance.createStreaming(sessionId, getHandleId(), createRequest), "create streaming");
         if (response == null) {
             errorReason = "Network error";
@@ -104,6 +112,20 @@ public class JanusStreamingPlugin extends JanusPlugin {
 
     public String getStreamingId() {
         return streamingId;
+    }
+
+    // Best-effort removal of a stale mountpoint left by a previous session.
+    // Ignores every outcome (no mountpoint, network error, server error): it is
+    // only a cleanup step before create(), which does its own error handling.
+    private void destroyIfExists() {
+        try {
+            JanusMessageRequest destroyRequest = new JanusMessageRequest(secret, "message", sessionId, getHandleId());
+            destroyRequest.setBody(new JanusMessageRequest.Body("destroy", streamingId));
+            destroyRequest.generateTransactionId();
+            ServerApiHelper.execute(apiInstance.sendMessage(sessionId, getHandleId(), destroyRequest), "destroy stale streaming");
+        } catch (Exception e) {
+            Log.w(Const.LOG_TAG, "Stale streaming mountpoint cleanup failed (ok if none existed): " + e.getMessage());
+        }
     }
 
     public int getAudioPort() {

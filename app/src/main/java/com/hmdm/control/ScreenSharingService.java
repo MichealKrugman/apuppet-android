@@ -184,6 +184,13 @@ public class ScreenSharingService extends Service {
     }
 
     private void requestSharing() {
+        // Android 14+ treats the screen-capture grant as a single-use token: it
+        // must not be silently reused for a later sharing session. Drop any
+        // projection retained from a previous session so tryShareScreen() always
+        // re-asks the user for consent on this one. destroyMediaProjection()
+        // unregisters our callback before stopping, so the MediaProjection
+        // onStop() path does not fire here.
+        destroyMediaProjection();
         if (!initRecorder()) {
             // Some initialization error, report to activity
             Intent intent = new Intent(Const.ACTION_SCREEN_SHARING_FAILED);

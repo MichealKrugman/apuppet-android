@@ -46,6 +46,11 @@ public class JanusTextRoomPlugin extends JanusPlugin {
     private boolean joined;
 
     private boolean dcResult;
+    // Set when a textroom "create" fails only because the room already exists
+    // (Janus error_code 418). With a stable per-install room id the room can
+    // still be in Janus memory from a previous session, so we treat that as
+    // success and just join it.
+    private boolean dcRoomExists;
     private Object dcResultLock = new Object();
 
     // Janus textroom binds to the data channel that the CLIENT opens; it never
@@ -387,6 +392,10 @@ public class JanusTextRoomPlugin extends JanusPlugin {
                         }
                     } else if ("error".equalsIgnoreCase(type)) {
                         synchronized (dcResultLock) {
+                            // error_code 418 = "room already exists" on create.
+                            // Written inside the lock so the waiting createRoom()
+                            // thread sees it alongside dcResult.
+                            dcRoomExists = (jsonObject.optInt("error_code", -1) == 418);
                             dcResult = false;
                             dcResultLock.notify();
                         }
@@ -470,6 +479,7 @@ public class JanusTextRoomPlugin extends JanusPlugin {
         String createMessage = "{\"textroom\":\"create\",\"is_private\":false,\"permanent\":false,\"transaction\":\"" + Utils.generateTransactionId() +
                 "\",\"room\":\"" + roomId + "\",\"pin\":\"" + password + "\"}";
 
+        dcRoomExists = false;
         sendToDataChannel(createMessage);
         synchronized (dcResultLock) {
             try {
@@ -479,10 +489,12 @@ public class JanusTextRoomPlugin extends JanusPlugin {
                 errorReason = "Interrupted";
                 return Const.INTERNAL_ERROR;
             }
-            if (!dcResult) {
+            if (!dcResult && !dcRoomExists) {
                 errorReason = "Failed to create a text room";
                 return Const.SERVER_ERROR;
             }
+            // dcRoomExists: the room survived from a previous session (our room id
+            // is stable per install). Treat as success and join it below.
         }
         return Const.SUCCESS;
     }
