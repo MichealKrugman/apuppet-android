@@ -17,6 +17,13 @@ import retrofit2.Call;
 import retrofit2.Response;
 
 public class JanusSessionPollService extends Service {
+    // A healthy long-poll returns a Janus keepalive roughly every ~30s (server
+    // keepalive). A couple of consecutive transport failures therefore means the
+    // session is genuinely gone (network dropped, or the server timed it out),
+    // not a transient blip. We surface that so the supervisor can reconnect
+    // instead of hammering a dead session id forever.
+    private static final int MAX_CONSECUTIVE_POLL_FAILURES = 3;
+
     private int state = Const.STATE_DISCONNECTED;
     private String session;
 
@@ -56,6 +63,7 @@ public class JanusSessionPollService extends Service {
         new Thread(new Runnable() {
             @Override
             public void run() {
+                int consecutiveFailures = 0;
                 while (true) {
                     currentCall = apiInstance.poll(session, secret);
                     Response<JanusPollResponse> response = ServerApiHelper.execute(currentCall, "poll session");
@@ -65,7 +73,16 @@ public class JanusSessionPollService extends Service {
                             state = Const.STATE_DISCONNECTED;
                             break;
                         } else {
-                            // Occasional error (already logged)
+                            consecutiveFailures++;
+                            if (consecutiveFailures >= MAX_CONSECUTIVE_POLL_FAILURES) {
+                                // The session is dead. Tell the supervisor so it
+                                // tears down and reconnects, then stop this loop.
+                                Log.w(Const.LOG_TAG, "Poll failed " + consecutiveFailures
+                                        + " times in a row; declaring session lost");
+                                broadcastSessionLost();
+                                state = Const.STATE_DISCONNECTED;
+                                break;
+                            }
                             try {
                                 Thread.sleep(1000);         // Avoid looping with 100% CPU
                             } catch (InterruptedException e) {
@@ -74,6 +91,7 @@ public class JanusSessionPollService extends Service {
                             continue;
                         }
                     }
+                    consecutiveFailures = 0;
                     Log.d(Const.LOG_TAG, "Polled data: " + response.body().toString());
                     String janus = response.body().getJanus();
                     if (janus == null) {
@@ -104,6 +122,15 @@ public class JanusSessionPollService extends Service {
                 }
             }
         }).start();
+    }
+
+    private void broadcastSessionLost() {
+        // Explicitly target our own package: an implicit broadcast is not
+        // reliably delivered to a RECEIVER_NOT_EXPORTED receiver.
+        Intent intent = new Intent(Const.ACTION_CONNECTION_LOST);
+        intent.setPackage(getPackageName());
+        intent.putExtra(Const.EXTRA_SESSION, session);
+        sendBroadcast(intent);
     }
 
     @Override

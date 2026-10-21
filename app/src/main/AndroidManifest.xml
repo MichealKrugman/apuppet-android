@@ -14,6 +14,13 @@
          without POST_NOTIFICATIONS. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- Headless resilience: restart the supervisor after a reboot/shutdown. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- API 34+: the ConnectionSupervisor runs as foregroundServiceType="specialUse". -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- API 29+: required to surface the screen-capture consent prompt over the
+         lock screen (full-screen intent) when an admin joins while idle. -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
     <!-- For test purposes only! -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
 
@@ -67,6 +74,31 @@
             android:exported="false"
             android:foregroundServiceType="mediaProjection"
             />
+
+        <!-- Owns the Janus connection: connect/reconnect with backoff, network
+             callback, boot restart, headless gesture dispatch, consent prompt.
+             specialUse (API 34+): an always-on remote-control agent session. -->
+        <service android:name=".ConnectionSupervisor"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="persistent remote-control agent: maintains the Janus session across screen-off, network changes and reboots" />
+        </service>
+
+        <!-- Restarts the supervisor after reboot. Not directBootAware: the room
+             id / server URL live in credential-encrypted storage, which is
+             unavailable until first unlock (BOOT_COMPLETED is after unlock). -->
+        <receiver
+            android:name=".BootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+        </receiver>
 
     </application>
 

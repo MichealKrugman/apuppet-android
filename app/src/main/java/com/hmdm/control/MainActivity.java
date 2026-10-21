@@ -28,9 +28,18 @@ import androidx.appcompat.app.AppCompatActivity;
 import androidx.appcompat.widget.Toolbar;
 import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 
-import com.hmdm.control.janus.SharingEngineJanus;
+// Headless design: the ConnectionSupervisor service owns the engine's
+// EventListener/StateListener slots. The Activity is a UI/consent shell that
+// renders from the supervisor's broadcasts (ACTION_ENGINE_STATE /
+// ACTION_ADMIN_CHANGED) and only appears for permission prompts.
+public class MainActivity extends AppCompatActivity {
 
-public class MainActivity extends AppCompatActivity implements SharingEngineJanus.EventListener, SharingEngineJanus.StateListener {
+    // ConnectionSupervisor -> UI: admin name changed (null = nobody in room).
+    public static final String ACTION_ADMIN_CHANGED = "com.hmdm.control.ADMIN_CHANGED";
+    public static final String EXTRA_ADMIN_NAME = "admin_name";
+    // Full-screen intent action: an admin is waiting for screen-capture
+    // consent; launching the Activity with this re-asks the system dialog.
+    public static final String ACTION_CONSENT = "com.hmdm.control.CONSENT";
 
     private ImageView imageViewConnStatus;
     private TextView textViewConnStatus;
@@ -67,6 +76,13 @@ public class MainActivity extends AppCompatActivity implements SharingEngineJanu
 
     private boolean needReconnect = false;
 
+    // True between onResume/onPause: startActivityForResult for the consent
+    // dialog is only safe from the foreground.
+    private boolean isResumed = false;
+    // Set when the Activity was launched by the consent notification
+    // (ACTION_CONSENT); onResume re-asks the screen-capture dialog.
+    private boolean consentKick = false;
+
     private MediaProjectionManager projectionManager;
 
     private BroadcastReceiver mSharingServiceReceiver = new BroadcastReceiver() {
@@ -82,7 +98,6 @@ public class MainActivity extends AppCompatActivity implements SharingEngineJanu
                 notifySharingStop();
                 adminName = null;
                 updateUI();
-                cancelSharingTimeout();
                 scheduleExitOnIdle();
 
             } else if (intent.getAction().equals(Const.ACTION_SCREEN_SHARING_FAILED)) {
@@ -92,7 +107,6 @@ public class MainActivity extends AppCompatActivity implements SharingEngineJanu
                 }
                 adminName = null;
                 updateUI();
-                cancelSharingTimeout();
                 scheduleExitOnIdle();
 
             } else if (intent.getAction().equals(Const.ACTION_CONNECTION_FAILURE)) {
@@ -101,7 +115,26 @@ public class MainActivity extends AppCompatActivity implements SharingEngineJanu
                 updateUI();
 
             } else if (intent.getAction().equals(Const.ACTION_SCREEN_SHARING_PERMISSION_NEEDED)) {
-                startActivityForResult(projectionManager.createScreenCaptureIntent(), Const.REQUEST_SCREEN_SHARE);
+                if (isResumed) {
+                    // Foreground: show the system consent dialog directly and
+                    // tell the supervisor not to post its notification.
+                    ConnectionSupervisor.consumeConsentPending();
+                    ConnectionSupervisor.cancelConsentNotification(MainActivity.this);
+                    startActivityForResult(projectionManager.createScreenCaptureIntent(), Const.REQUEST_SCREEN_SHARE);
+                } else {
+                    // Backgrounded: Android blocks activity starts from here.
+                    // Post the full-screen consent notification instead; tapping
+                    // it (or the screen turning on) launches this Activity with
+                    // ACTION_CONSENT, which re-asks in onResume.
+                    ConnectionSupervisor.showConsentNotification(MainActivity.this, adminName);
+                }
+
+            } else if (intent.getAction().equals(Const.ACTION_ENGINE_STATE)) {
+                updateUI();
+
+            } else if (intent.getAction().equals(ACTION_ADMIN_CHANGED)) {
+                adminName = intent.getStringExtra(EXTRA_ADMIN_NAME);
+                updateUI();
             }
         }
     };
@@ -119,8 +152,9 @@ public class MainActivity extends AppCompatActivity implements SharingEngineJanu
         setSupportActionBar(toolbar);
         settingsHelper = SettingsHelper.getInstance(this);
         sharingEngine = SharingEngineFactory.getSharingEngine();
-        sharingEngine.setEventListener(this);
-        sharingEngine.setStateListener(this);
+        // NOTE: engine listeners (EventListener/StateListener) are owned by
+        // ConnectionSupervisor, never by this Activity — otherwise a background
+        // Activity recreate would steal them from the supervisor.
 
         DisplayMetrics metrics = new DisplayMetrics();
         ScreenSharingHelper.getRealScreenSize(this, metrics);
@@ -136,17 +170,54 @@ public class MainActivity extends AppCompatActivity implements SharingEngineJanu
         intentFilter.addAction(Const.ACTION_SCREEN_SHARING_PERMISSION_NEEDED);
         intentFilter.addAction(Const.ACTION_SCREEN_SHARING_FAILED);
         intentFilter.addAction(Const.ACTION_CONNECTION_FAILURE);
+        // Supervisor -> UI state/admin updates.
+        intentFilter.addAction(Const.ACTION_ENGINE_STATE);
+        intentFilter.addAction(ACTION_ADMIN_CHANGED);
         LocalBroadcastManager.getInstance(this).registerReceiver(mSharingServiceReceiver, intentFilter);
+        ConnectionSupervisor.setActivityAlive(true);
 
         projectionManager = (MediaProjectionManager)getSystemService(Context.MEDIA_PROJECTION_SERVICE);
+
+        handleConsentIntent(getIntent());
 
         initUI();
         setDefaultSettings();
     }
 
     @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleConsentIntent(intent);
+    }
+
+    private void handleConsentIntent(Intent intent) {
+        if (intent != null && ACTION_CONSENT.equals(intent.getAction())) {
+            consentKick = true;
+            String admin = intent.getStringExtra(EXTRA_ADMIN_NAME);
+            if (admin != null) {
+                adminName = admin;
+            }
+        }
+    }
+
+    @Override
     protected void onResume() {
         super.onResume();
+        isResumed = true;
+        maybeAskNotificationPermission();
+        // Pairing identifiers for the UI / "send link" action (the supervisor
+        // does the actual connecting).
+        sessionId = settingsHelper.getString(SettingsHelper.KEY_ROOM_ID);
+        password = BuildConfig.DEFAULT_ROOM_PIN;
+        // If a consent prompt is outstanding (launched here from the
+        // notification, or re-entering the app while an admin waits), re-ask
+        // the system dialog now that we are in the foreground.
+        if (consentKick || ConnectionSupervisor.consumeConsentPending()) {
+            consentKick = false;
+            ConnectionSupervisor.cancelConsentNotification(this);
+            ScreenSharingHelper.requestSharing(this);
+        }
         updateUI();
 
         startService(new Intent(MainActivity.this, GestureDispatchService.class));
@@ -169,6 +240,29 @@ public class MainActivity extends AppCompatActivity implements SharingEngineJanu
         }
     }
 
+    @Override
+    protected void onPause() {
+        isResumed = false;
+        super.onPause();
+    }
+
+    /**
+     * API 33+: notifications are the channel the headless consent prompt
+     * comes through (full-screen intent when an admin joins while the device
+     * is idle). Ask exactly once — this is a permission popup, which is the
+     * only UI the headless agent is supposed to show.
+     */
+    private void maybeAskNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= 33
+                && !settingsHelper.getBoolean(SettingsHelper.KEY_NOTIFICATIONS_ASKED)
+                && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                        != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            settingsHelper.setBoolean(SettingsHelper.KEY_NOTIFICATIONS_ASKED, true);
+            requestPermissions(new String[]{android.Manifest.permission.POST_NOTIFICATIONS},
+                    Const.REQUEST_PERMISSION_NOTIFICATIONS);
+        }
+    }
+
     private void configureAndConnect() {
         if (settingsHelper.getString(SettingsHelper.KEY_SERVER_URL) == null) {
             // Not configured yet
@@ -180,23 +274,19 @@ public class MainActivity extends AppCompatActivity implements SharingEngineJanu
             return;
         }
 
+        // The supervisor owns the connection: started on every resume, and
+        // explicitly told to rebuild the session after settings changes.
         if (needReconnect) {
-            // Here we go after changing settings
             needReconnect = false;
-            if (sharingEngine.getState() != Const.STATE_DISCONNECTED) {
-                sharingEngine.disconnect(MainActivity.this, (success, errorReason) -> connect());
-            } else {
-                connect();
-            }
+            ConnectionSupervisor.reconnect(this);
         } else {
-            if (sharingEngine.getState() == Const.STATE_DISCONNECTED && sharingEngine.getErrorReason() == null) {
-                connect();
-            }
+            ConnectionSupervisor.start(this);
         }
     }
 
     @Override
     public void onDestroy() {
+        ConnectionSupervisor.setActivityAlive(false);
         try {
             LocalBroadcastManager.getInstance(this).unregisterReceiver(mSharingServiceReceiver);
         } catch (Exception e) {
@@ -269,7 +359,9 @@ public class MainActivity extends AppCompatActivity implements SharingEngineJanu
                 Toast.makeText(this, R.string.screen_cast_denied, Toast.LENGTH_LONG).show();
                 adminName = null;
                 updateUI();
-                cancelSharingTimeout();
+                // Drop the ping watchdog / pending prompt on the supervisor
+                // side too, so a denial does not reconnect the session later.
+                ConnectionSupervisor.onConsentDenied(this);
                 scheduleExitOnIdle();
             } else {
                 ScreenSharingHelper.startSharing(this, resultCode, data);
@@ -295,22 +387,14 @@ public class MainActivity extends AppCompatActivity implements SharingEngineJanu
     }
 
     private void gracefulExit() {
+        // "Exit" closes the UI only: the headless ConnectionSupervisor keeps
+        // the agent running and connected (it would also restart via
+        // START_STICKY, so killing the process here would just churn).
         if (adminName != null) {
             notifySharingStop();
             ScreenSharingHelper.stopSharing(MainActivity.this, true);
         }
-        sharingEngine.disconnect(MainActivity.this, (success, errorReason) -> exitApp());
-        // 5 sec timeout to exit
-        handler.postDelayed(() -> exitApp(), 5000);
-    }
-
-    private void exitApp() {
-        Intent intent = new Intent(MainActivity.this, ScreenSharingService.class);
-        stopService(intent);
-        intent = new Intent(MainActivity.this, GestureDispatchService.class);
-        stopService(intent);
         finishAffinity();
-        System.exit(0);
     }
 
     private void updateUI() {
@@ -370,9 +454,10 @@ public class MainActivity extends AppCompatActivity implements SharingEngineJanu
         if (settingsHelper.getInt(SettingsHelper.KEY_FRAME_RATE) == 0) {
             settingsHelper.setInt(SettingsHelper.KEY_FRAME_RATE, Const.DEFAULT_FRAME_RATE);
         }
-        if (settingsHelper.getInt(SettingsHelper.KEY_IDLE_TIMEOUT) == 0) {
-            settingsHelper.setInt(SettingsHelper.KEY_IDLE_TIMEOUT, Const.DEFAULT_IDLE_TIMEOUT);
-        }
+        // Headless agent: idle auto-exit stays disabled no matter what was
+        // stored or what the settings screen wrote. The supervisor also
+        // re-forces this on every start command.
+        settingsHelper.setInt(SettingsHelper.KEY_IDLE_TIMEOUT, Const.DEFAULT_IDLE_TIMEOUT);
         if (settingsHelper.getInt(SettingsHelper.KEY_PING_TIMEOUT) == 0) {
             settingsHelper.setInt(SettingsHelper.KEY_PING_TIMEOUT, Const.DEFAULT_PING_TIMEOUT);
         }
@@ -409,81 +494,17 @@ public class MainActivity extends AppCompatActivity implements SharingEngineJanu
         // Pairing is resolved from the install itself: the room is a per-install
         // random id (so two identical phones cannot collide) and the PIN is
         // baked in at build time. No session id or password is shown in the UI.
+        // The connection itself is owned by ConnectionSupervisor; this button
+        // just asks it to rebuild the session.
         sessionId = settingsHelper.getString(SettingsHelper.KEY_ROOM_ID);
         password = BuildConfig.DEFAULT_ROOM_PIN;
-        sharingEngine.setUsername(settingsHelper.getString(SettingsHelper.KEY_DEVICE_NAME));
-        sharingEngine.connect(this, sessionId, password, (success, errorReason) -> {
-            if (!success) {
-                String message = getString(R.string.connection_error, settingsHelper.getString(SettingsHelper.KEY_SERVER_URL), errorReason);
-                Toast.makeText(MainActivity.this, message, Toast.LENGTH_LONG).show();
-                editTextSessionId.setText(null);
-                editTextPassword.setText(null);
-            }
-        });
-
-        scheduleExitOnIdle();
+        ConnectionSupervisor.reconnect(this);
     }
 
-    @Override
-    public void onStartSharing(String adminName) {
-        // This event is raised when the admin joins the text room
-        this.adminName = adminName;
-        updateUI();
-        cancelExitOnIdle();
-        scheduleSharingTimeout();
-        ScreenSharingHelper.requestSharing(this);
-    }
-
-    @Override
-    public void onStopSharing() {
-        // This event is raised when the admin leaves the text room
-        notifySharingStop();
-        adminName = null;
-        updateUI();
-        cancelSharingTimeout();
-        scheduleExitOnIdle();
-        ScreenSharingHelper.stopSharing(this, false);
-    }
-
-    @Override
-    public void onRemoteControlEvent(String event) {
-        Intent intent = new Intent(MainActivity.this, GestureDispatchService.class);
-        intent.setAction(Const.ACTION_GESTURE);
-        intent.putExtra(Const.EXTRA_EVENT, event);
-        startService(intent);
-    }
-
-    @Override
-    public void onPing() {
-        if (adminName != null) {
-            cancelSharingTimeout();
-            scheduleSharingTimeout();
-        }
-    }
-
-    @Override
-    public void onSharingApiStateChanged(int state) {
-        updateUI();
-        if (state == Const.STATE_CONNECTED) {
-            String rtpHost = Utils.getRtpUrl(settingsHelper.getString(SettingsHelper.KEY_SERVER_URL));
-            int rtpAudioPort = sharingEngine.getAudioPort();
-            int rtpVideoPort = sharingEngine.getVideoPort();
-            String testDstIp = settingsHelper.getString(SettingsHelper.KEY_TEST_DST_IP);
-            if (testDstIp != null && !testDstIp.trim().equals("")) {
-                rtpHost = testDstIp;
-                rtpVideoPort = Const.TEST_RTP_PORT;
-                Toast.makeText(this, "Test mode: sending stream to " + rtpHost + ":" + rtpVideoPort, Toast.LENGTH_LONG).show();
-            }
-
-            ScreenSharingHelper.configure(this, settingsHelper.getBoolean(SettingsHelper.KEY_TRANSLATE_AUDIO),
-                    settingsHelper.getInt(SettingsHelper.KEY_FRAME_RATE),
-                    settingsHelper.getInt(SettingsHelper.KEY_BITRATE),
-                    rtpHost,
-                    rtpAudioPort,
-                    rtpVideoPort
-                    );
-        }
-    }
+    // NOTE: onStartSharing/onStopSharing/onPing/onRemoteControlEvent/
+    // onSharingApiStateChanged used to live here. ConnectionSupervisor now
+    // owns both engine listener slots; this Activity learns about the same
+    // events through ACTION_ADMIN_CHANGED / ACTION_ENGINE_STATE broadcasts.
 
     private void scheduleExitOnIdle() {
         int exitOnIdleTimeout = settingsHelper.getInt(SettingsHelper.KEY_IDLE_TIMEOUT);
@@ -535,34 +556,9 @@ public class MainActivity extends AppCompatActivity implements SharingEngineJanu
         handler.postDelayed(exitRunnable, 1000);
     }
 
-    private void scheduleSharingTimeout() {
-        int pingTimeout = settingsHelper.getInt(SettingsHelper.KEY_PING_TIMEOUT);
-        if (pingTimeout > 0) {
-            Log.d(Const.LOG_TAG, "Scheduling sharing stop in " + (pingTimeout * 1000) + " sec");
-            handler.postDelayed(sharingStopByPingTimeoutRunnable, pingTimeout * 1000);
-        }
-    }
-
-    private void cancelSharingTimeout() {
-        Log.d(Const.LOG_TAG, "Cancelling scheduled sharing stop");
-        handler.removeCallbacks(sharingStopByPingTimeoutRunnable);
-    }
-
-    private Runnable sharingStopByPingTimeoutRunnable = new Runnable() {
-        @Override
-        public void run() {
-            Toast.makeText(MainActivity.this, R.string.app_sharing_session_ping_timeout, Toast.LENGTH_LONG).show();
-            if (adminName != null) {
-                notifySharingStop();
-                ScreenSharingHelper.stopSharing(MainActivity.this, false);
-            }
-            adminName = null;
-            updateUI();
-            cancelSharingTimeout();
-            scheduleExitOnIdle();
-            sharingEngine.disconnect(MainActivity.this, (success, errorReason) -> connect());
-        }
-    };
+    // NOTE: the sharing ping-timeout watchdog (scheduleSharingTimeout /
+    // cancelSharingTimeout / sharingStopByPingTimeoutRunnable) moved into
+    // ConnectionSupervisor so it runs with no Activity alive.
 
     private Runnable overlayDotRunnable = new Runnable() {
         @Override

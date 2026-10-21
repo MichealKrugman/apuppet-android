@@ -26,6 +26,9 @@ public class SettingsHelper {
     public static final String KEY_NOTIFY_SHARING = "notify_sharing";
     public static final String KEY_IDLE_TIMEOUT = "idle_timeout";
     public static final String KEY_PING_TIMEOUT = "session_timeout";
+    // One-shot gate for the POST_NOTIFICATIONS runtime request: the headless
+    // consent prompt cannot surface without it, so we ask exactly once.
+    public static final String KEY_NOTIFICATIONS_ASKED = "notifications_asked";
 
     private SharedPreferences sharedPreferences;
 
