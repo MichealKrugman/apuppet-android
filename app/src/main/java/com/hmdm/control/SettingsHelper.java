@@ -14,6 +14,10 @@ public class SettingsHelper {
     public static final String KEY_SERVER_URL = "server_url";
     public static final String KEY_SECRET = "secret";
     public static final String KEY_DEVICE_NAME = "device_name";
+    // Per-install random text-room name. Persisted once so the same physical
+    // device always joins the same room, while two identical models cannot
+    // collide (the raw device name would be shared by both).
+    public static final String KEY_ROOM_ID = "room_id";
     public static final String KEY_TRANSLATE_AUDIO = "translate_audio";
     public static final String KEY_BITRATE = "bitrate";
     public static final String KEY_FRAME_RATE = "frame_rate";

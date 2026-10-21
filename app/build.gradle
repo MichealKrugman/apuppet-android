@@ -12,6 +12,10 @@ if (localPropsFile.exists()) {
 def unquote = { value -> (value ?: '').replaceAll(/^["']|["']$/, '') }
 def localServerUrl = unquote(localProps.getProperty('DEFAULT_SERVER_URL'))
 def localServerSecret = unquote(localProps.getProperty('DEFAULT_SECRET'))
+// Text-room PIN baked in at build time (see DEFAULT_ROOM_PIN in local.properties).
+// KNOWN WEAK: a static PIN shared by every build is not a real secret. It is a
+// stop-gap until per-device credentials land in Phase 5.
+def localRoomPin = unquote(localProps.getProperty('DEFAULT_ROOM_PIN'))
 
 android {
     namespace 'com.hmdm.control'
@@ -31,6 +35,7 @@ android {
         // "Supplying the server URL and secret". Both are empty when unset.
         buildConfigField "String", "DEFAULT_SERVER_URL", "\"${localServerUrl}\""
         buildConfigField "String", "DEFAULT_SECRET", "\"${localServerSecret}\""
+        buildConfigField "String", "DEFAULT_ROOM_PIN", "\"${localRoomPin}\""
 
         // Build variant displayed on the "About" screen
         buildConfigField("String", "VARIANT", "\"opensource\"")

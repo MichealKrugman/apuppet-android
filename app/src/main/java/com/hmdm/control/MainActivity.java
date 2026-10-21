@@ -358,6 +358,12 @@ public class MainActivity extends AppCompatActivity implements SharingEngineJanu
         if (settingsHelper.getString(SettingsHelper.KEY_DEVICE_NAME) == null) {
             settingsHelper.setString(SettingsHelper.KEY_DEVICE_NAME, Build.MANUFACTURER + " " + Build.MODEL);
         }
+        if (settingsHelper.getString(SettingsHelper.KEY_ROOM_ID) == null) {
+            // Per-install random room name: stable for this install, unique
+            // across devices so two identical models cannot collide. Not the
+            // raw device name (that is shared by every unit of a model).
+            settingsHelper.setString(SettingsHelper.KEY_ROOM_ID, "room-" + Utils.randomString(10, false));
+        }
         if (settingsHelper.getInt(SettingsHelper.KEY_BITRATE) == 0) {
             settingsHelper.setInt(SettingsHelper.KEY_BITRATE, Const.DEFAULT_BITRATE);
         }
@@ -400,10 +406,11 @@ public class MainActivity extends AppCompatActivity implements SharingEngineJanu
     }
 
     private void connect() {
-        if (sessionId == null || password == null) {
-            sessionId = Utils.randomString(8, true);
-            password = Utils.randomString(4, true);
-        }
+        // Pairing is resolved from the install itself: the room is a per-install
+        // random id (so two identical phones cannot collide) and the PIN is
+        // baked in at build time. No session id or password is shown in the UI.
+        sessionId = settingsHelper.getString(SettingsHelper.KEY_ROOM_ID);
+        password = BuildConfig.DEFAULT_ROOM_PIN;
         sharingEngine.setUsername(settingsHelper.getString(SettingsHelper.KEY_DEVICE_NAME));
         sharingEngine.connect(this, sessionId, password, (success, errorReason) -> {
             if (!success) {
