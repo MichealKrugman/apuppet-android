@@ -87,7 +87,10 @@ public class ScreenSharingService extends Service {
         Log.d(Const.LOG_TAG, "ScreenSharingService created");
         mPacketizer = new H264Packetizer();
         mProjectionManager = (MediaProjectionManager)getSystemService(Context.MEDIA_PROJECTION_SERVICE);
-        startAsForeground();
+        // NOT startAsForeground() here: when targeting API 34+, starting a
+        // foreground service of type mediaProjection before the user has granted
+        // screen-capture consent throws SecurityException. We become foreground in
+        // startSharing(), immediately after getMediaProjection() returns a token.
     }
 
     private void startAsForeground() {
@@ -103,7 +106,10 @@ public class ScreenSharingService extends Service {
         }
         Intent intent = new Intent(this, MainActivity.class);
         intent.setFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
-        PendingIntent pendingIntent = PendingIntent.getActivity(this, Const.REQUEST_FROM_NOTIFICATION, intent, PendingIntent.FLAG_UPDATE_CURRENT);
+        // FLAG_IMMUTABLE is mandatory when targeting API 31+ (the platform throws
+        // IllegalArgumentException without it). This PendingIntent only opens our
+        // own MainActivity and is never mutated, so immutable is also correct.
+        PendingIntent pendingIntent = PendingIntent.getActivity(this, Const.REQUEST_FROM_NOTIFICATION, intent, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
         Notification notification = builder
                 .setContentTitle(getString(R.string.app_name))
                 .setTicker(getString(R.string.app_name))
@@ -201,6 +207,15 @@ public class ScreenSharingService extends Service {
 
     private void startSharing(int resultCode, Intent data) {
         mMediaProjection = mProjectionManager.getMediaProjection(resultCode, data);
+        if (mMediaProjection == null) {
+            // Consent was revoked/expired between the dialog and this command.
+            // Must not continue: we were started with startForegroundService() and
+            // would otherwise trip the "did not call startForeground()" watchdog.
+            Log.e(Const.LOG_TAG, "ScreenSharingService: getMediaProjection returned null");
+            LocalBroadcastManager.getInstance(this).sendBroadcast(new Intent(Const.ACTION_SCREEN_SHARING_FAILED));
+            stopSelf();
+            return;
+        }
         mMediaProjectionCallback = new MediaProjection.Callback() {
             @Override
             public void onStop() {
@@ -210,6 +225,9 @@ public class ScreenSharingService extends Service {
             }
         };
         mMediaProjection.registerCallback(mMediaProjectionCallback, null);
+        // Foreground only now: the API 34 mediaProjection type requires a granted
+        // projection token, which we hold as of the line above.
+        startAsForeground();
         mVirtualDisplay = createVirtualDisplay();
         mMediaCodec.start();
         startSending();
@@ -234,6 +252,9 @@ public class ScreenSharingService extends Service {
         mPacketizer.stop();
         mVirtualDisplay.release();
         mMediaCodec.release();
+        // Sharing ended: drop the "device is remotely controlled" notification,
+        // otherwise it would stay visible until the process dies.
+        stopForeground(true);
         if (destroyMediaProjection) {
             destroyMediaProjection();
         }

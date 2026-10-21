@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.os.Build;
 import android.util.Log;
 
 import com.hmdm.control.Const;
@@ -101,7 +102,15 @@ public class JanusSession {
     }
 
     public void startPolling(Context context) {
-        context.registerReceiver(pollServiceReceiver, new IntentFilter(Const.ACTION_JANUS_SESSION_POLL));
+        // API 34+ requires every non-system registerReceiver() to declare
+        // RECEIVER_EXPORTED or RECEIVER_NOT_EXPORTED. Only our own
+        // JanusSessionPollService (same app UID) sends this broadcast, so it
+        // must not be exported.
+        int flags = 0;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            flags = Context.RECEIVER_NOT_EXPORTED;
+        }
+        context.registerReceiver(pollServiceReceiver, new IntentFilter(Const.ACTION_JANUS_SESSION_POLL), flags);
         Intent intent = new Intent(context, JanusSessionPollService.class);
         intent.putExtra(Const.EXTRA_SESSION, sessionId);
         context.startService(intent);

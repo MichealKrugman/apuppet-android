@@ -93,7 +93,13 @@ public class ScreenSharingHelper {
     }
 
     private static void executeCommand(Activity activity, Intent intent) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        // Only ACTION_START_SHARING may go through startForegroundService(): the
+        // service becomes a foreground service of type mediaProjection right after
+        // it obtains the projection token, which is what API 34+ requires. Every
+        // other command runs as a regular started service, so the 5s
+        // "did not call startForeground()" watchdog never applies to them.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                && ScreenSharingService.ACTION_START_SHARING.equals(intent.getAction())) {
             activity.startForegroundService(intent);
         } else {
             activity.startService(intent);
