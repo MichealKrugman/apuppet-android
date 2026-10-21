@@ -45,11 +45,14 @@ public class JanusSession {
         @Override
         public void onReceive(Context context, Intent intent) {
             String event = intent.getStringExtra(Const.EXTRA_EVENT);
+            Log.i(Const.LOG_TAG, "pollServiceReceiver.onReceive: event=" + event + ", pluginMap=" + pluginMap.keySet());
             for (Map.Entry<String,JanusPlugin> entry : pluginMap.entrySet()) {
                 if (Const.EXTRA_WEBRTCUP.equalsIgnoreCase(event)) {
                     entry.getValue().onWebRtcUp(context);
                 } else if (Const.EXTRA_EVENT.equalsIgnoreCase(event)) {
                     JanusPollResponse message = (JanusPollResponse) intent.getSerializableExtra(Const.EXTRA_MESSAGE);
+                    Log.i(Const.LOG_TAG, "pollServiceReceiver: message=" + (message == null ? "NULL" : "ok")
+                            + ", plugindata=" + (message == null || message.getPlugindata() == null ? "NULL" : message.getPlugindata().getPlugin()));
                     if (message != null && message.getPlugindata() != null) {
                         String pluginName = message.getPlugindata().getPlugin();
                         if (entry.getKey().equalsIgnoreCase(pluginName)) {
@@ -111,6 +114,7 @@ public class JanusSession {
             flags = Context.RECEIVER_NOT_EXPORTED;
         }
         context.registerReceiver(pollServiceReceiver, new IntentFilter(Const.ACTION_JANUS_SESSION_POLL), flags);
+        Log.i(Const.LOG_TAG, "startPolling: pollServiceReceiver registered, flags=" + flags);
         Intent intent = new Intent(context, JanusSessionPollService.class);
         intent.putExtra(Const.EXTRA_SESSION, sessionId);
         context.startService(intent);

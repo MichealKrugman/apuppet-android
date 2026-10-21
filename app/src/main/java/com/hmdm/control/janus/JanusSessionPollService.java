@@ -82,11 +82,19 @@ public class JanusSessionPollService extends Service {
                     } else if (janus.equalsIgnoreCase("keepalive")) {
                         Log.d(Const.LOG_TAG, "Janus: Keep-Alive");
                     } else if (janus.equalsIgnoreCase("webrtcup")) {
+                        Log.i(Const.LOG_TAG, "Poll: sending webrtcup broadcast");
                         Intent intent = new Intent(Const.ACTION_JANUS_SESSION_POLL);
+                        // Explicitly target our own package: an implicit broadcast is
+                        // not reliably delivered to a RECEIVER_NOT_EXPORTED receiver.
+                        intent.setPackage(getPackageName());
                         intent.putExtra(Const.EXTRA_EVENT, Const.EXTRA_WEBRTCUP);
                         sendBroadcast(intent);
                     } else if (janus.equalsIgnoreCase("event")) {
+                        Log.i(Const.LOG_TAG, "Poll: sending event broadcast, plugindata=" + (response.body().getPlugindata() == null ? "NULL" : response.body().getPlugindata().getPlugin()));
                         Intent intent = new Intent(Const.ACTION_JANUS_SESSION_POLL);
+                        // Explicitly target our own package: an implicit broadcast is
+                        // not reliably delivered to a RECEIVER_NOT_EXPORTED receiver.
+                        intent.setPackage(getPackageName());
                         intent.putExtra(Const.EXTRA_EVENT, Const.EXTRA_EVENT);
                         intent.putExtra(Const.EXTRA_MESSAGE, response.body());
                         sendBroadcast(intent);
