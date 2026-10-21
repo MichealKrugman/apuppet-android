@@ -1,26 +1,36 @@
 apply plugin: 'com.android.application'
-apply plugin: 'com.google.gms.google-services'
-apply plugin: 'com.google.firebase.crashlytics'
+
+// --- Local deployment config ------------------------------------------------
+// local.properties is gitignored (see .gitignore), so the server URL and secret
+// can never be committed. Keys are optional; missing keys build empty strings.
+def localProps = new Properties()
+def localPropsFile = rootProject.file('local.properties')
+if (localPropsFile.exists()) {
+    localPropsFile.withInputStream { localProps.load(it) }
+}
+// Tolerate values pasted with surrounding quotes.
+def unquote = { value -> (value ?: '').replaceAll(/^["']|["']$/, '') }
+def localServerUrl = unquote(localProps.getProperty('DEFAULT_SERVER_URL'))
+def localServerSecret = unquote(localProps.getProperty('DEFAULT_SECRET'))
 
 android {
-    compileSdkVersion 29
-    buildToolsVersion "29.0.3"
+    namespace 'com.hmdm.control'
+    compileSdkVersion 34
 
     defaultConfig {
         applicationId "com.hmdm.control"
         minSdkVersion 24
-        targetSdkVersion 29
+        targetSdkVersion 34
         versionCode 16
         versionName "1.16"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
 
-        // Default server URL (including last "/", for example: https://srv.apuppet.org/web-admin/ )
-        // Leave empty if you do not need to preconfigure any server URL
-        buildConfigField("String", "DEFAULT_SERVER_URL", "\"\"")
-        // Default server secret (leave empty if no secret should be preconfigured;
-        // secret is required to connect to the server)
-        buildConfigField("String", "DEFAULT_SECRET", "\"\"")
+        // Server URL and secret are deployment-specific and must never enter git.
+        // They are read from local.properties (gitignored); see README section
+        // "Supplying the server URL and secret". Both are empty when unset.
+        buildConfigField "String", "DEFAULT_SERVER_URL", "\"${localServerUrl}\""
+        buildConfigField "String", "DEFAULT_SECRET", "\"${localServerSecret}\""
 
         // Build variant displayed on the "About" screen
         buildConfigField("String", "VARIANT", "\"opensource\"")
@@ -31,6 +41,11 @@ android {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
+    }
+
+    buildFeatures {
+        // AGP 8 disables buildConfig by default; this project relies on it.
+        buildConfig true
     }
 
     compileOptions {
@@ -59,9 +74,11 @@ dependencies {
     implementation 'com.fasterxml.jackson.core:jackson-annotations:2.9.4'
     implementation 'com.fasterxml.jackson.core:jackson-databind:2.9.4'
 
-    implementation 'com.google.firebase:firebase-crashlytics:17.2.1'
+    // WebRTC: upstream used the floating 'org.webrtc:google-webrtc:1.0.+' from the
+    // now-dead jcenter. This is the maintained Maven Central successor; it ships the
+    // same org.webrtc.* API (verified: PeerConnection/PeerConnectionFactory/DataChannel
+    // present in classes.jar of 1.3.8). Pinned for reproducible builds.
+    implementation 'io.getstream:stream-webrtc-android:1.3.8'
 
-    // WebRTC
-    implementation 'org.webrtc:google-webrtc:1.0.+'
     implementation 'androidx.localbroadcastmanager:localbroadcastmanager:1.0.0'
 }

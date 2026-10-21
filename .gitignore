@@ -12,3 +12,6 @@
 /captures
 .externalNativeBuild
 .cxx
+
+# Firebase config - never commit (brief rule 7)
+app/google-services.json
