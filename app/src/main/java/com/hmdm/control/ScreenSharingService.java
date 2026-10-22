@@ -57,6 +57,12 @@ public class ScreenSharingService extends Service {
     private MediaCodec mMediaCodec;
     private Surface mInputSurface;
 
+    // True between ACTION_REQUEST_SHARING and ACTION_STOP_SHARING: the current
+    // session still wants screen capture. A consent result that arrives after a
+    // stop (user left the system dialog pending, admin disconnected meanwhile)
+    // must be refused, not started.
+    private boolean mConsentRequested;
+
     private AbstractPacketizer mPacketizer;
 
     public static final String ACTION_SET_METRICS = "metrics";
@@ -204,6 +210,7 @@ public class ScreenSharingService extends Service {
         // unregisters our callback before stopping, so the MediaProjection
         // onStop() path does not fire here.
         destroyMediaProjection();
+        mConsentRequested = true;
         if (!initRecorder()) {
             // Some initialization error, report to activity
             Intent intent = new Intent(Const.ACTION_SCREEN_SHARING_FAILED);
@@ -250,6 +257,47 @@ public class ScreenSharingService extends Service {
             stopSelf();
             return;
         }
+        // Refuse a late consent grant: if a stop ran while the system consent
+        // dialog was still pending (admin disconnected mid-prompt), the session
+        // that asked for consent is gone. Starting capture now would run the
+        // encoder and show the "remotely controlled" notification with nobody
+        // watching. Drop the freshly granted token and bow out cleanly.
+        if (!mConsentRequested) {
+            Log.w(Const.LOG_TAG, "ScreenSharingService: consent arrived after stop, ignoring");
+            destroyMediaProjection();
+            LocalBroadcastManager.getInstance(this).sendBroadcast(new Intent(Const.ACTION_SCREEN_SHARING_FAILED));
+            stopForeground(true);
+            stopSelf();
+            return;
+        }
+        if (mScreenWidth <= 0 || mScreenHeight <= 0 || mScreenDensity <= 0) {
+            // A start intent redelivered to a restarted process can reach this
+            // point before ACTION_SET_METRICS; createVirtualDisplay() would
+            // throw "Virtual display width must be positive" and kill the app.
+            Log.e(Const.LOG_TAG, "ScreenSharingService: start without screen metrics, refusing");
+            destroyMediaProjection();
+            LocalBroadcastManager.getInstance(this).sendBroadcast(new Intent(Const.ACTION_SCREEN_SHARING_FAILED));
+            stopForeground(true);
+            stopSelf();
+            return;
+        }
+        // The encoder built in requestSharing() may since have been stopped or
+        // released by an intervening stop command (admin left while the consent
+        // dialog was up), and MediaCodec.start() on it throws, which used to
+        // crash the whole process. Always start from a fresh configured codec.
+        if (mMediaCodec != null) {
+            try {
+                mMediaCodec.release();
+            } catch (Exception ignored) {
+            }
+            mMediaCodec = null;
+        }
+        if (!initRecorder()) {
+            LocalBroadcastManager.getInstance(this).sendBroadcast(new Intent(Const.ACTION_SCREEN_SHARING_FAILED));
+            stopForeground(true);
+            stopSelf();
+            return;
+        }
         mMediaProjectionCallback = new MediaProjection.Callback() {
             @Override
             public void onStop() {
@@ -258,17 +306,34 @@ public class ScreenSharingService extends Service {
                 LocalBroadcastManager.getInstance(ScreenSharingService.this).sendBroadcast(new Intent(Const.ACTION_SCREEN_SHARING_STOP));
             }
         };
-        mMediaProjection.registerCallback(mMediaProjectionCallback, null);
-        mVirtualDisplay = createVirtualDisplay();
-        mMediaCodec.start();
-        startSending();
+        try {
+            mMediaProjection.registerCallback(mMediaProjectionCallback, null);
+            mVirtualDisplay = createVirtualDisplay();
+            mMediaCodec.start();
+            startSending();
+        } catch (Exception e) {
+            // Never let a start failure kill the process: that would take the
+            // connection supervisor down with it and break the guarantee that
+            // the agent stays connected. Report the failure and stop cleanly.
+            Log.e(Const.LOG_TAG, "ScreenSharingService: start failed", e);
+            try {
+                stopSharing(false);
+            } catch (Exception ignored) {
+            }
+            LocalBroadcastManager.getInstance(this).sendBroadcast(new Intent(Const.ACTION_SCREEN_SHARING_FAILED));
+            stopForeground(true);
+            stopSelf();
+        }
 
     }
 
     public void stopSharing(boolean destroyMediaProjection) {
+        mConsentRequested = false;
         try {
             mPacketizer.stop();
-            mMediaCodec.stop();
+            if (mMediaCodec != null) {
+                mMediaCodec.stop();
+            }
             Log.v(Const.LOG_TAG, "Stopping Recording");
             stopScreenSharing(destroyMediaProjection);
         } catch (Exception e) {
@@ -282,7 +347,12 @@ public class ScreenSharingService extends Service {
         }
         mPacketizer.stop();
         mVirtualDisplay.release();
+        mVirtualDisplay = null;
         mMediaCodec.release();
+        // Null both members: a stale non-null mVirtualDisplay used to skip the
+        // early return on a second stop and release a codec that a pending
+        // consent would later try to start ("codec is released already" crash).
+        mMediaCodec = null;
         // Sharing ended: drop the "device is remotely controlled" notification,
         // otherwise it would stay visible until the process dies.
         stopForeground(true);
@@ -293,7 +363,10 @@ public class ScreenSharingService extends Service {
 
     private void destroyMediaProjection() {
         if (mMediaProjection != null) {
-            mMediaProjection.unregisterCallback(mMediaProjectionCallback);
+            if (mMediaProjectionCallback != null) {
+                mMediaProjection.unregisterCallback(mMediaProjectionCallback);
+                mMediaProjectionCallback = null;
+            }
             mMediaProjection.stop();
             mMediaProjection = null;
         }

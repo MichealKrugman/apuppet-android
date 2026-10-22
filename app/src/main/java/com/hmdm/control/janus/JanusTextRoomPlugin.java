@@ -44,6 +44,9 @@ public class JanusTextRoomPlugin extends JanusPlugin {
     private PeerConnection peerConnection;
     private DataChannel dataChannel;
     private boolean joined;
+    // Kept for signalling datachannel death to the supervisor (init() has the
+    // only Context; the base JanusPlugin does not retain one).
+    private Context appContext;
 
     private boolean dcResult;
     // Set when a textroom "create" fails only because the room already exists
@@ -79,6 +82,7 @@ public class JanusTextRoomPlugin extends JanusPlugin {
     @Override
     public void init(Context context) {
         super.init(context);
+        appContext = context.getApplicationContext();
         PeerConnectionFactory.InitializationOptions initializationOptions =
                 PeerConnectionFactory.InitializationOptions.builder(context)
                         .createInitializationOptions();
@@ -103,8 +107,16 @@ public class JanusTextRoomPlugin extends JanusPlugin {
             @Override
             public void onIceConnectionChange(PeerConnection.IceConnectionState iceConnectionState) {
                 Log.d(Const.LOG_TAG, "Textroom plugin: iceConnectionState changed to " + iceConnectionState);
-                // ICE connection is not implemented properly, but it doesn't matter
-                // because the traffic is going through Janus which is not behind the firewall
+                // FAILED is terminal for this PeerConnection: the control
+                // datachannel is dead even though the Janus HTTP session (and
+                // its keep-alives) can stay alive, which would leave the agent
+                // blind to admin joins. Emit the same connection-lost signal the
+                // poll service uses so the supervisor tears down and reconnects.
+                if (iceConnectionState == PeerConnection.IceConnectionState.FAILED && appContext != null) {
+                    Intent intent = new Intent(Const.ACTION_CONNECTION_LOST);
+                    intent.setPackage(appContext.getPackageName());
+                    appContext.sendBroadcast(intent);
+                }
             }
 
             @Override
