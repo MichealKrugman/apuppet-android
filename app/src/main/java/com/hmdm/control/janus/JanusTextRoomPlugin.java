@@ -66,6 +66,10 @@ public class JanusTextRoomPlugin extends JanusPlugin {
     // Guards against signalling readiness more than once (e.g. if both the local
     // channel and, on some Janus builds, onDataChannel() were to fire).
     private boolean channelReadySignalled;
+    // Guards the connection-lost broadcast below: the observer can report FAILED
+    // more than once per PeerConnection, and duplicate signals used to start
+    // overlapping connect flows.
+    private boolean iceFailureReported;
 
     private Handler handler = new Handler();
     private Runnable hangupProtectionRunnable = null;
@@ -96,6 +100,7 @@ public class JanusTextRoomPlugin extends JanusPlugin {
         this.completionHandler = completionHandler;
         this.eventListener = eventListener;
         this.channelReadySignalled = false;
+        this.iceFailureReported = false;
         // No ICE servers required for textroom: textroom messages are all coming through Janus
         List<PeerConnection.IceServer> iceServers = new LinkedList<>();
         peerConnection = peerConnectionFactory.createPeerConnection(iceServers, new PeerConnection.Observer() {
@@ -112,7 +117,9 @@ public class JanusTextRoomPlugin extends JanusPlugin {
                 // its keep-alives) can stay alive, which would leave the agent
                 // blind to admin joins. Emit the same connection-lost signal the
                 // poll service uses so the supervisor tears down and reconnects.
-                if (iceConnectionState == PeerConnection.IceConnectionState.FAILED && appContext != null) {
+                if (iceConnectionState == PeerConnection.IceConnectionState.FAILED
+                        && appContext != null && !iceFailureReported) {
+                    iceFailureReported = true;
                     Intent intent = new Intent(Const.ACTION_CONNECTION_LOST);
                     intent.setPackage(appContext.getPackageName());
                     appContext.sendBroadcast(intent);
@@ -397,6 +404,25 @@ public class JanusTextRoomPlugin extends JanusPlugin {
                         if (list != null) {
                             // This is the response to test request, nothing to do
                             return;
+                        }
+                        // A join success carries the participants already in the
+                        // room. If an admin was waiting when we (re)joined, its
+                        // "join" event fired before we subscribed and we would
+                        // never see it; treat an admin already present as if it
+                        // just joined, so a reconnecting device picks the remote
+                        // session back up on its own.
+                        JSONArray participants = jsonObject.optJSONArray("participants");
+                        if (participants != null && eventListener != null) {
+                            for (int i = 0; i < participants.length(); i++) {
+                                JSONObject p = participants.optJSONObject(i);
+                                String username = p != null ? p.optString("username") : "";
+                                if (username != null && username.startsWith("admin:")) {
+                                    final String admin = username;
+                                    Log.d(Const.LOG_TAG, "Admin already in room after join: " + admin);
+                                    handler.post(() -> eventListener.onStartSharing(admin));
+                                    break;
+                                }
+                            }
                         }
                         synchronized (dcResultLock) {
                             dcResult = true;

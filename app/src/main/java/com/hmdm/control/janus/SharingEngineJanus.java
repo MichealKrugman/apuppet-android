@@ -3,6 +3,7 @@ package com.hmdm.control.janus;
 import android.content.Context;
 import android.os.AsyncTask;
 import android.os.Handler;
+import android.util.Log;
 
 import com.hmdm.control.Const;
 import com.hmdm.control.SharingEngine;
@@ -15,6 +16,13 @@ public class SharingEngineJanus extends SharingEngine {
     private JanusSession janusSession;
     private JanusTextRoomPlugin janusTextRoomPlugin;
     private JanusStreamingPlugin janusStreamingPlugin;
+
+    // Guards connect() against overlapping connect flows: a burst of
+    // connection-lost signals (flappy NAT) used to start a second connect()
+    // whose reset() nulled janusSession while the first flow's AsyncTask was
+    // still using it (NPE, process death). Cleared when the flow completes or
+    // on disconnect().
+    private volatile boolean connectInFlight;
 
     private Handler handler = new Handler();
 
@@ -34,6 +42,12 @@ public class SharingEngineJanus extends SharingEngine {
             return;
         }
 
+        if (connectInFlight) {
+            Log.d(Const.LOG_TAG, "connect already in progress, ignoring");
+            completionHandler.onComplete(false, "Connect already in progress");
+            return;
+        }
+
         reset();
         this.sessionId = sessionId;
         this.password = password;
@@ -45,30 +59,54 @@ public class SharingEngineJanus extends SharingEngine {
         // This must be initialized in the main thread because it uses a handler to run commands in UI thread
         janusTextRoomPlugin = new JanusTextRoomPlugin();
 
+        // Final captures: the tasks below run across suspension points while
+        // reset()/disconnect() may null the fields; always use these locals.
+        final JanusSession session = janusSession;
+        final JanusTextRoomPlugin textRoom = janusTextRoomPlugin;
+        final CompletionHandler wrapped = new CompletionHandler() {
+            @Override
+            public void onComplete(boolean success, String errorReason) {
+                // A superseded flow (reset() ran, a newer connect owns the
+                // field) must be fully inert: no state changes, no callback
+                // into the supervisor, no unlocking the newer flow's guard.
+                if (janusSession != session) {
+                    Log.d(Const.LOG_TAG, "stale connect flow result ignored: success=" + success);
+                    return;
+                }
+                connectInFlight = false;
+                completionHandler.onComplete(success, errorReason);
+            }
+        };
+        connectInFlight = true;
+
         // Start Janus connection flow
         new AsyncTask<Void, Void, Integer>() {
             @Override
             protected Integer doInBackground(Void... voids) {
-                int result = janusSession.create();
+                int result = session.create();
                 if (result != Const.SUCCESS) {
-                    errorReason = janusSession.getErrorReason();
+                    errorReason = session.getErrorReason();
                     return result;
                 }
 
-                janusSession.startPolling(context);
+                session.startPolling(context);
 
-                janusTextRoomPlugin.init(context);
-                result = janusSession.attachPlugin(janusTextRoomPlugin);
+                textRoom.init(context);
+                result = session.attachPlugin(textRoom);
                 if (result != Const.SUCCESS) {
                     return result;
                 }
 
                 // The successful flow is continued after creating a data channel
-                janusTextRoomPlugin.createPeerConnection((success, errorReason) -> {
+                textRoom.createPeerConnection((success, errorReason) -> {
                             if (!success) {
-                                handler.post(() -> completionHandler.onComplete(false, errorReason));
+                                handler.post(() -> wrapped.onComplete(false, errorReason));
                             } else {
-                                dataChannelCreated(context, completionHandler);
+                                // Pass this flow's objects explicitly: this
+                                // callback runs on a WebRTC thread and reading
+                                // the fields here raced a concurrent reset()
+                                // (null plugin -> NPE in createRoom).
+                                dataChannelCreated(context, wrapped, textRoom, session);
                             }
                         }, new EventListener() {
                             @Override
@@ -103,8 +141,8 @@ public class SharingEngineJanus extends SharingEngine {
                         });
 
                 // Completion handler is needed here to handle errors
-                janusTextRoomPlugin.setupRtcSession((success, errorReason) -> {
-                    handler.post(() -> completionHandler.onComplete(false, errorReason));
+                textRoom.setupRtcSession((success, errorReason) -> {
+                    handler.post(() -> wrapped.onComplete(false, errorReason));
                 });
 
                 return Const.SUCCESS;
@@ -112,9 +150,15 @@ public class SharingEngineJanus extends SharingEngine {
 
             @Override
             protected void onPostExecute(Integer result) {
+                if (janusSession != session) {
+                    // Superseded by a newer connect/disconnect: a stale failure
+                    // must not tear down the current flow's state.
+                    Log.d(Const.LOG_TAG, "stale connect flow result ignored: " + result);
+                    return;
+                }
                 if (result != Const.SUCCESS) {
                     setState(Const.STATE_DISCONNECTED);
-                    completionHandler.onComplete(false, errorReason);
+                    wrapped.onComplete(false, errorReason);
                     reset();
                 }
                 // On success, the flow is continued in createPeerConnection when data channel is created
@@ -122,25 +166,33 @@ public class SharingEngineJanus extends SharingEngine {
         }.execute();
     }
 
-    private void dataChannelCreated(Context context, CompletionHandler completionHandler) {
+    private void dataChannelCreated(Context context, CompletionHandler completionHandler,
+                                    final JanusTextRoomPlugin textRoom, final JanusSession session) {
         new AsyncTask<Void, Void, Integer>() {
 
             @Override
             protected Integer doInBackground(Void... voids) {
-                int result = janusTextRoomPlugin.createRoom(sessionId, password);
+                int result = textRoom.createRoom(sessionId, password);
                 if (result != Const.SUCCESS) {
                     return result;
                 }
 
-                result = janusTextRoomPlugin.joinRoom("device:" + username, username);
+                result = textRoom.joinRoom("device:" + username, username);
                 if (result != Const.SUCCESS) {
                     return result;
+                }
+
+                // A superseded flow must not install its streaming plugin over
+                // the current flow's.
+                if (janusTextRoomPlugin != textRoom) {
+                    Log.d(Const.LOG_TAG, "stale datachannel flow, dropping");
+                    return Const.SUCCESS;
                 }
 
                 // Streaming
                 janusStreamingPlugin = new JanusStreamingPlugin();
                 janusStreamingPlugin.init(context);
-                result = janusSession.attachPlugin(janusStreamingPlugin);
+                result = session.attachPlugin(janusStreamingPlugin);
                 if (result != Const.SUCCESS) {
                     return result;
                 }
@@ -152,6 +204,10 @@ public class SharingEngineJanus extends SharingEngine {
 
             @Override
             protected void onPostExecute(Integer result) {
+                if (janusTextRoomPlugin != textRoom) {
+                    Log.d(Const.LOG_TAG, "stale datachannel flow result ignored: " + result);
+                    return;
+                }
                 if (result != Const.SUCCESS) {
                     setState(Const.STATE_DISCONNECTED);
                     completionHandler.onComplete(false, errorReason);
@@ -166,6 +222,8 @@ public class SharingEngineJanus extends SharingEngine {
 
     @Override
     public void disconnect(final Context context, final CompletionHandler completionHandler) {
+        // A disconnect supersedes any in-flight connect flow.
+        connectInFlight = false;
         errorReason = null;
         setState(Const.STATE_DISCONNECTING);
 
