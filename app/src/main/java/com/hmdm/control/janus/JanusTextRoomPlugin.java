@@ -207,12 +207,21 @@ public class JanusTextRoomPlugin extends JanusPlugin {
 
             synchronized (pollingEventLock) {
                 try {
-                    pollingEventLock.wait();
+                    // Bounded wait: a dead transport (e.g. a wss created on a
+                    // network that then vanished) must fail the flow, not hang
+                    // the AsyncTask forever and block all reconnects.
+                    pollingEventLock.wait(30000);
                 } catch (InterruptedException e) {
                     errorReason = "Interrupted";
                     completionHandler.onComplete(false, errorReason);
                     return;
                 }
+            }
+            if (pollingEvent == null) {
+                errorReason = "Timeout waiting for JSEP answer";
+                Log.w(Const.LOG_TAG, errorReason);
+                completionHandler.onComplete(false, errorReason);
+                return;
             }
             Jsep jsepData = pollingEvent.getJsep();
             if (jsepData == null) {
@@ -320,12 +329,18 @@ public class JanusTextRoomPlugin extends JanusPlugin {
 
             synchronized (pollingEventLock) {
                 try {
-                    pollingEventLock.wait();
+                    pollingEventLock.wait(30000); // bounded, see JSEP-offer wait above
                 } catch (InterruptedException e) {
                     errorReason = "Interrupted";
                     completionHandler.onComplete(false, errorReason);
                     return;
                 }
+            }
+            if (pollingEvent == null) {
+                errorReason = "Timeout waiting for join response";
+                Log.w(Const.LOG_TAG, errorReason);
+                completionHandler.onComplete(false, errorReason);
+                return;
             }
             if (pollingEvent.getPlugindata() == null || pollingEvent.getPlugindata().getData() == null ||
                     !"ok".equalsIgnoreCase(pollingEvent.getPlugindata().getData().getResult())) {
@@ -518,10 +533,11 @@ public class JanusTextRoomPlugin extends JanusPlugin {
                 "\",\"room\":\"" + roomId + "\",\"pin\":\"" + password + "\"}";
 
         dcRoomExists = false;
+        dcResult = false; // clear any stale result before awaiting this response
         sendToDataChannel(createMessage);
         synchronized (dcResultLock) {
             try {
-                dcResultLock.wait();
+                dcResultLock.wait(30000); // bounded: dead datachannel must fail, not hang
             } catch (InterruptedException e) {
                 e.printStackTrace();
                 errorReason = "Interrupted";
@@ -541,10 +557,11 @@ public class JanusTextRoomPlugin extends JanusPlugin {
         String joinMessage = "{\"textroom\":\"join\",\"room\":\"" + roomId + "\",\"username\":\"" + username + "\",\"display\":\"" + displayName +
                 "\",\"pin\":\"" + password + "\", \"transaction\":\"" + Utils.generateTransactionId() + "\"}";
 
+        dcResult = false; // clear any stale result before awaiting this response
         sendToDataChannel(joinMessage);
         synchronized (dcResultLock) {
             try {
-                dcResultLock.wait();
+                dcResultLock.wait(30000); // bounded: dead datachannel must fail, not hang
             } catch (InterruptedException e) {
                 e.printStackTrace();
                 errorReason = "Interrupted";
@@ -563,11 +580,14 @@ public class JanusTextRoomPlugin extends JanusPlugin {
         String sendCommand = "{\"textroom\":\"message\",\"room\":\"" + roomId + "\",\"text\":\"" + message + "\",\"ack\":" + ack + "," +
                 "\"transaction\":\"" + Utils.generateTransactionId() + "\"}";
 
+        if (ack) {
+            dcResult = false; // clear any stale result before awaiting the ack
+        }
         sendToDataChannel(sendCommand);
         if (ack) {
             synchronized (dcResultLock) {
                 try {
-                    dcResultLock.wait();
+                    dcResultLock.wait(30000); // bounded: dead datachannel must fail, not hang
                 } catch (InterruptedException e) {
                     e.printStackTrace();
                     errorReason = "Interrupted";

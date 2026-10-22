@@ -21,8 +21,11 @@ public class SharingEngineJanus extends SharingEngine {
     // connection-lost signals (flappy NAT) used to start a second connect()
     // whose reset() nulled janusSession while the first flow's AsyncTask was
     // still using it (NPE, process death). Cleared when the flow completes or
-    // on disconnect().
+    // on disconnect(), and released by the 90s guard timeout below.
     private volatile boolean connectInFlight;
+    // Monotonic id: a guard-timeout scheduled by an old flow must not release
+    // a newer flow's guard.
+    private volatile int connectGeneration;
 
     private Handler handler = new Handler();
 
@@ -78,6 +81,18 @@ public class SharingEngineJanus extends SharingEngine {
             }
         };
         connectInFlight = true;
+        // Belt-and-braces: if this flow wedges (e.g. a wss created on a
+        // network that then vanished, so no completion callback ever fires),
+        // release the guard after 90s so the supervisor's scheduled reconnect
+        // can proceed. Observed live 2026-10-22: cellular died mid-connect and
+        // every later reconnect was rejected with "Connect already in progress".
+        final int generation = ++connectGeneration;
+        handler.postDelayed(() -> {
+            if (connectInFlight && connectGeneration == generation) {
+                Log.w(Const.LOG_TAG, "connect guard timeout after 90s, releasing");
+                connectInFlight = false;
+            }
+        }, 90000);
 
         // Start Janus connection flow
         new AsyncTask<Void, Void, Integer>() {
