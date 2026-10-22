@@ -217,7 +217,12 @@ async def main():
         # False). Ping the device IMMEDIATELY and continuously regardless of
         # detection: the supervisor's ping watchdog (20s) tears the session
         # down otherwise (observed: "ping timeout ... rebuilding session").
-        join_state = {"joined": False}
+        # rejoin: set on hard evidence we are out of the room (a "destroyed"
+        # event or a 422/"Not in room"/"No such room" error); the hold loop
+        # answers it with exactly one join attempt, and a fresh failure
+        # re-arms it -- so retries are bounded while healthy and persistent
+        # only while actually out.
+        join_state = {"joined": False, "rejoin": False}
 
         @local_dc.on("message")
         def _join_watcher(raw):
@@ -227,10 +232,33 @@ async def main():
                 return
             if d.get("transaction") == jt or d.get("textroom") == "success":
                 join_state["joined"] = True
+            # Pings sent while out of the room are answered 422 forever,
+            # which starves the device's datachannel of traffic and lets the
+            # NAT kill the mapping (the 2026-10-22 death spiral: flap ->
+            # room destroyed -> harness evicted -> no pings -> idle death ->
+            # flap), so prompt rejoining is load-bearing.
+            if d.get("textroom") == "destroyed":
+                join_state["joined"] = False
+                join_state["rejoin"] = True
+                print("REJOIN flagged: room destroyed", flush=True)
+            elif d.get("textroom") == "error":
+                err = str(d.get("error", ""))
+                if d.get("error_code") == 422 or "Not in room" in err or \
+                        "No such room" in err:
+                    join_state["joined"] = False
+                    join_state["rejoin"] = True
+                    print("REJOIN flagged: %s" % (err or d.get("error_code")),
+                          flush=True)
 
         dc.send(json.dumps({"textroom": "join", "room": ROOM, "pin": PIN,
                             "username": "admin:apitest", "display": "apitest",
                             "transaction": jt}))
+        # Ping IMMEDIATELY: the supervisor's watchdog fires 20s after the
+        # admin is seen with no ping, and the hold loop only starts after
+        # video-leg setup (observed 2026-10-22: "ping timeout" at join+20s
+        # stopped sharing before the first loop ping could land).
+        dc.send(json.dumps({"textroom": "message", "room": ROOM,
+                            "text": "ping,0", "transaction": txn()}))
         await asyncio.sleep(3)
         joined = join_state["joined"]
         print("JOIN-RESULT: joined=%s" % joined, flush=True)
@@ -420,9 +448,13 @@ async def main():
                     print("VIDEO-ICE-PAIR: none nominated", flush=True)
                 else:
                     L, R = pair.local_candidate, pair.remote_candidate
+                    # aioice 0.10.2: Candidate.protocol was renamed to
+                    # Candidate.transport ("udp") -- tolerate either.
+                    lp = getattr(L, "transport", getattr(L, "protocol", "?"))
+                    rp = getattr(R, "transport", getattr(R, "protocol", "?"))
                     print("VIDEO-ICE-PAIR local=%s:%d(%s,%s) remote=%s:%d(%s,%s)" % (
-                        L.host, L.port, L.type, L.protocol,
-                        R.host, R.port, R.type, R.protocol), flush=True)
+                        L.host, L.port, L.type, lp,
+                        R.host, R.port, R.type, rp), flush=True)
                     inrange = RTP_PORT_MIN <= R.port <= RTP_PORT_MAX
                     print("VIDEO-PORT-CHECK janus-side port %d in %d-%d: %s" % (
                         R.port, RTP_PORT_MIN, RTP_PORT_MAX, inrange), flush=True)
@@ -468,10 +500,19 @@ async def main():
         n = 0
         last_frames = 0
         while loop.time() < deadline:
-            await asyncio.sleep(8)
+            # Ping BEFORE sleeping (not after an 8s sleep): with the watchdog
+            # window at 20s and video-leg setup eating the first ~15s, the
+            # first loop ping must fire as soon as the loop starts.
             n += 1
             await send({"janus": "keepalive", "session_id": sid, "transaction": txn()})
             if dc.readyState == "open":
+                if join_state["rejoin"]:
+                    join_state["rejoin"] = False
+                    print("REJOIN: re-sending join", flush=True)
+                    dc.send(json.dumps({"textroom": "join", "room": ROOM,
+                                        "pin": PIN, "username": "admin:apitest",
+                                        "display": "apitest",
+                                        "transaction": txn()}))
                 # chat keepalive the real web-admin sends; keeps the device's
                 # ping watchdog (20s) from tearing the session down
                 dc.send(json.dumps({"textroom": "message", "room": ROOM,
@@ -479,6 +520,7 @@ async def main():
             if vstats["frames"] != last_frames:
                 print("VIDEO progress: %d frames total" % vstats["frames"], flush=True)
                 last_frames = vstats["frames"]
+            await asyncio.sleep(8)
 
         # ---- final evidence -------------------------------------------------
         pc = vstats.get("pc")

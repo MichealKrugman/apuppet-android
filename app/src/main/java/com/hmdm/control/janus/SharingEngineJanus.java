@@ -239,6 +239,13 @@ public class SharingEngineJanus extends SharingEngine {
     public void disconnect(final Context context, final CompletionHandler completionHandler) {
         // A disconnect supersedes any in-flight connect flow.
         connectInFlight = false;
+        // Mark the current plugin stale NOW: janusSession.destroy() below
+        // closes the PeerConnection, and its FAILED can fire between destroy
+        // and the reset() in onPostExecute. A planned teardown must never
+        // broadcast connection loss back into the supervisor.
+        if (janusTextRoomPlugin != null) {
+            janusTextRoomPlugin.markStale();
+        }
         errorReason = null;
         setState(Const.STATE_DISCONNECTING);
 
@@ -267,6 +274,13 @@ public class SharingEngineJanus extends SharingEngine {
     }
 
     private void reset() {
+        // The plugin we are about to drop belongs to a dead flow; mark it so
+        // its PeerConnection's late FAILED cannot broadcast connection-loss
+        // (that broadcast is what tore down healthy connections right after
+        // they joined, sustaining the reconnect churn).
+        if (janusTextRoomPlugin != null) {
+            janusTextRoomPlugin.markStale();
+        }
         sessionId = null;
         password = null;
         janusSession = null;

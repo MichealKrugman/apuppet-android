@@ -70,6 +70,13 @@ public class JanusTextRoomPlugin extends JanusPlugin {
     // more than once per PeerConnection, and duplicate signals used to start
     // overlapping connect flows.
     private boolean iceFailureReported;
+    // Set by the engine when this plugin's flow is superseded or torn down.
+    // A dead flow's PeerConnection keeps emitting ICE state changes for
+    // seconds after teardown (observed live 2026-10-22: a superseded PC's
+    // FAILED arrived 154ms after the NEW flow joined the room; the broadcast
+    // tore the healthy connection down again and sustained a reconnect
+    // churn). A stale instance must not broadcast connection loss.
+    private volatile boolean stale;
 
     private Handler handler = new Handler();
     private Runnable hangupProtectionRunnable = null;
@@ -81,6 +88,12 @@ public class JanusTextRoomPlugin extends JanusPlugin {
 
     public String getRoomId() {
         return roomId;
+    }
+
+    // Called by the engine when this plugin's flow is being dropped (new
+    // connect supersedes it, or disconnect/reset runs). See the stale field.
+    public void markStale() {
+        stale = true;
     }
 
     @Override
@@ -119,6 +132,13 @@ public class JanusTextRoomPlugin extends JanusPlugin {
                 // poll service uses so the supervisor tears down and reconnects.
                 if (iceConnectionState == PeerConnection.IceConnectionState.FAILED
                         && appContext != null && !iceFailureReported) {
+                    if (stale) {
+                        // Superseded flow dying: the current flow owns the
+                        // connection now. Broadcasting would have the
+                        // supervisor tear down the healthy connection.
+                        Log.d(Const.LOG_TAG, "Textroom plugin: stale PC FAILED ignored");
+                        return;
+                    }
                     iceFailureReported = true;
                     Intent intent = new Intent(Const.ACTION_CONNECTION_LOST);
                     intent.setPackage(appContext.getPackageName());
@@ -604,30 +624,20 @@ public class JanusTextRoomPlugin extends JanusPlugin {
 
     @Override
     public int destroy() {
- /*       if (dataChannel != null) {
-            String destroyMessage = "{\"textroom\":\"destroy\",\"room\":\"" + roomId + "\",\"permanent\":false,\"transaction\":\"" + Utils.generateTransactionId() + "\"}";
-            sendToDataChannel(destroyMessage);
-        }*/
-        // DataChannel may be broken, so we destroy using HTTP
-        destroyViaHttp();
-        return Const.SUCCESS;
-    }
-
-    private int destroyViaHttp() {
-        JanusMessageRequest destroyRequest = new JanusMessageRequest(secret, "message", sessionId, getHandleId());
-        destroyRequest.setBody(new JanusMessageRequest.Body("destroy", null, roomId));
-        destroyRequest.generateTransactionId();
-
-        Response<JanusResponse> response = ServerApiHelper.execute(apiInstance.sendMessage(sessionId, getHandleId(), destroyRequest), "destroy textroom");
-        if (response == null) {
-            errorReason = "Network error";
-            return Const.NETWORK_ERROR;
-        }
-        if (response.body() == null || !response.body().getJanus().equalsIgnoreCase("success")) {
-            errorReason = "Server error";
-            Log.w(Const.LOG_TAG, "Wrong server response: " + response.body().toString());
-            return Const.SERVER_ERROR;
-        }
+        // Deliberately do NOT destroy the textroom room. This runs on every
+        // transient disconnect -- ICE flap, network switch, ping-timeout
+        // rebuild -- and the HTTP destroy this used to do evicted the admin
+        // from the room on each flap (observed live 2026-10-22 13:12:28: the
+        // harness was kicked, every ping then got 422 "Not in room", the
+        // device's datachannel went idle with nobody to receive pings from,
+        // the NAT killed the mapping in ~10-15s, and the flap-destroy-rejoin
+        // loop never ended). JanusSession.destroy() tears down the session
+        // right after this method runs, which removes our participant and
+        // mountpoint server-side and makes Janus broadcast "left" to whoever
+        // is still in the room; the room itself has a stable id per install
+        // (createRoom already handles "Room already exists") and lives until
+        // Janus restarts. An explicit unpair flow will destroy it when that
+        // exists (Phase 5).
         return Const.SUCCESS;
     }
 }

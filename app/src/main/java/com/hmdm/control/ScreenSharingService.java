@@ -203,6 +203,19 @@ public class ScreenSharingService extends Service {
     }
 
     private void requestSharing() {
+        // Idempotent on rejoin: with the textroom room surviving flaps, the
+        // "admin already in the room" resumption path fires this again after
+        // every reconnect while capture is still running. Tearing down the
+        // live projection to re-ask consent (or stacking a second dialog)
+        // would break a working session -- ignore duplicates instead.
+        if (mMediaProjection != null && mVirtualDisplay != null) {
+            Log.d(Const.LOG_TAG, "ScreenSharingService: already sharing, ignoring duplicate request");
+            return;
+        }
+        if (mConsentRequested) {
+            Log.d(Const.LOG_TAG, "ScreenSharingService: consent already pending, ignoring duplicate request");
+            return;
+        }
         // Android 14+ treats the screen-capture grant as a single-use token: it
         // must not be silently reused for a later sharing session. Drop any
         // projection retained from a previous session so tryShareScreen() always
@@ -311,6 +324,9 @@ public class ScreenSharingService extends Service {
             mVirtualDisplay = createVirtualDisplay();
             mMediaCodec.start();
             startSending();
+            // Success anchor for tests/review: pairing with the refusal logs
+            // above tells you definitively whether a start attempt ran capture.
+            Log.i(Const.LOG_TAG, "ScreenSharingService: sharing started (virtual display + encoder up)");
         } catch (Exception e) {
             // Never let a start failure kill the process: that would take the
             // connection supervisor down with it and break the guarantee that
