@@ -251,7 +251,7 @@ async def main():
                           flush=True)
 
         dc.send(json.dumps({"textroom": "join", "room": ROOM, "pin": PIN,
-                            "username": "admin:apitest", "display": "apitest",
+                            "username": "probe:test", "display": "apitest",
                             "transaction": jt}))
         # Ping IMMEDIATELY: the supervisor's watchdog fires 20s after the
         # admin is seen with no ping, and the hold loop only starts after
@@ -515,7 +515,7 @@ async def main():
                     join_state["rejoin"] = False
                     print("REJOIN: re-sending join", flush=True)
                     dc.send(json.dumps({"textroom": "join", "room": ROOM,
-                                        "pin": PIN, "username": "admin:apitest",
+                                        "pin": PIN, "username": "probe:test",
                                         "display": "apitest",
                                         "transaction": txn()}))
                 # chat keepalive the real web-admin sends; keeps the device's
