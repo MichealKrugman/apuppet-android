@@ -304,6 +304,16 @@ public class SharingEngineJanus extends SharingEngine {
         return 0;
     }
 
+    @Override
+    public void notifyScreenResolution() {
+        // Rotation mid-session: the supervisor has already updated
+        // screenWidth/screenHeight (applyScreenMetrics). Tell the connected
+        // admin so its canvas/gesture scale follows the new aspect ratio.
+        if (janusTextRoomPlugin != null && getState() == Const.STATE_CONNECTED) {
+            janusTextRoomPlugin.sendMessage(screenResolutionMessage(), false);
+        }
+    }
+
     private String screenResolutionMessage() {
         return "streamingVideoResolution," + screenWidth + "," + screenHeight;
     }

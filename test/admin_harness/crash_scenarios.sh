@@ -13,6 +13,10 @@
 #      NPE on janusSession (AsyncTask dereferenced a field nulled by reset())
 #   4. Datachannel death mid-connect -> dataChannelCreated() field capture used
 #      to race reset() on a WebRTC thread (NPE on createRoom)
+#   5. App process killed (SIGKILL via run-as, like lmkd) (a) while the consent
+#      dialog is pending and (b) right after the start command (mid-start): no
+#      capture may restart from the sticky redelivery, no crash. onStartCommand
+#      returns START_STICKY, which the sticky restart observed here confirms.
 #
 # Prerequisites (see also README.md in this directory):
 #   - device attached via adb, screen ON and UNLOCKED, app installed and
@@ -198,6 +202,82 @@ scenario_4() {
 }
 
 # --------------------------------------------------------------------------
+# 5a/5b: SIGKILL the whole app process at the two dangerous moments. The
+# debuggable build allows `run-as ... kill -9` (same uid; equivalent to an
+# lmkd kill). ScreenSharingService.onStartCommand returns START_STICKY
+# (ScreenSharingService.java:145 for a null intent, :176 otherwise), so the
+# system restarts the service with the last intent -- the redelivery path
+# scenario 2 could not reach from adb.
+scenario_5() {
+  echo "== Scenario 5: kill the app process mid-start and during pending consent =="
+  if ! wait_alive 30; then FAIL "s5: app process not running"; return; fi
+  if ! adb shell "run-as $APP sh -c 'echo ok'" 2>/dev/null | grep -q ok; then
+    FAIL "s5: run-as unavailable on this build; kill injection cannot be tested"
+    stop_harness; return
+  fi
+  local pid_before new_pid f_before started_before started_after
+
+  # --- 5a: kill while the consent dialog is pending -------------------------
+  start_harness 240 >/dev/null
+  if ! wait_log "admin joined" 30; then FAIL "s5a: device never saw the admin join"; stop_harness; return; fi
+  adb shell am start -n $APP/.MainActivity >/dev/null 2>&1
+  sleep 2.5    # dialog rendered (Activity alive)
+  pid_before=$(pid); f_before=$(fatals)
+  adb logcat -c
+  echo "  5a: killing the process (pid $pid_before) while consent is pending..."
+  adb shell run-as $APP kill -9 "$pid_before"
+  sleep 10     # sticky restart window
+  echo "  5a: tapping the stale consent dialog after the restart..."
+  adb shell input tap "$TAP_X" "$TAP_Y"
+  sleep 8
+  if adb logcat -d 2>/dev/null | grep -q "sharing started (virtual display"; then
+    FAIL "s5a: capture started after kill during pending consent"
+  else PASS "s5a: no capture started from the stale grant"; fi
+  if [ "$(fatals)" -gt "$f_before" ]; then FAIL "s5a: FATAL EXCEPTION after the kill"; else PASS "s5a: no crash"; fi
+  new_pid=$(pid)
+  if [ -n "$new_pid" ] && [ "$new_pid" != "$pid_before" ]; then
+    PASS "s5a: service restarted sticky on its own (pid $pid_before -> $new_pid)"
+  elif [ -z "$new_pid" ]; then
+    FAIL "s5a: process did not restart after kill (START_STICKY not honoured?)"
+  else
+    FAIL "s5a: pid unchanged after kill -9 (kill did not take?)"
+  fi
+  stop_harness
+
+  # --- 5b: kill mid-start (right after the start command) -------------------
+  adb shell am start -n $APP/.MainActivity >/dev/null 2>&1
+  sleep 2
+  start_harness 240 >/dev/null
+  # 180s, not 30s: the 5a kill orphaned the device's Janus session server-side,
+  # and until that zombie times out (janus session_timeout ~60s + cleanup) the
+  # restarted device's join is refused with 420 "Username already taken" and
+  # only retries with backoff (observed live 2026-10-22: rejoined at +110s).
+  if ! wait_log "admin joined" 180; then FAIL "s5b: device never saw the admin join"; stop_harness; return; fi
+  sleep 2.5    # consent dialog rendered
+  adb shell input tap "$TAP_X" "$TAP_Y"   # grant -> start command follows
+  if ! wait_log "got command: start" 15; then FAIL "s5b: start command never arrived"; stop_harness; return; fi
+  pid_before=$(pid); f_before=$(fatals)
+  started_before=$(adb logcat -d 2>/dev/null | grep -c "sharing started (virtual display")
+  adb logcat -c
+  echo "  5b: killing the process (pid $pid_before) mid-start..."
+  adb shell run-as $APP kill -9 "$pid_before"
+  sleep 12     # sticky restart + redelivered intent settle
+  started_after=$(adb logcat -d 2>/dev/null | grep -c "sharing started (virtual display")
+  if [ "$started_after" -eq 0 ]; then
+    PASS "s5b: redelivered start did not restart capture (sharing-started lines after kill: $started_after, before: $started_before)"
+  else FAIL "s5b: capture restarted after the mid-start kill ($started_after start lines)"; fi
+  if [ "$(fatals)" -gt "$f_before" ]; then FAIL "s5b: FATAL EXCEPTION after the kill"; else PASS "s5b: no crash"; fi
+  new_pid=$(pid)
+  if [ -n "$new_pid" ] && [ "$new_pid" != "$pid_before" ]; then
+    PASS "s5b: service restarted sticky on its own (pid $pid_before -> $new_pid)"
+  else
+    FAIL "s5b: process did not restart after kill (pid now: ${new_pid:-gone})"
+  fi
+  stop_harness
+  adb shell am start -n $APP/.MainActivity >/dev/null 2>&1   # leave the rig as found
+}
+
+# --------------------------------------------------------------------------
 SCENARIOS=${*:-all}
 for s in $SCENARIOS; do
   case "$s" in
@@ -205,8 +285,9 @@ for s in $SCENARIOS; do
     2) scenario_2 ;;
     3) scenario_3 ;;
     4) scenario_4 ;;
-    all) scenario_1; scenario_2; scenario_3; scenario_4 ;;
-    *) echo "unknown scenario: $s (use 1|2|3|4|all)"; exit 2 ;;
+    5) scenario_5 ;;
+    all) scenario_1; scenario_2; scenario_3; scenario_4; scenario_5 ;;
+    *) echo "unknown scenario: $s (use 1|2|3|4|5|all)"; exit 2 ;;
   esac
 done
 stop_harness

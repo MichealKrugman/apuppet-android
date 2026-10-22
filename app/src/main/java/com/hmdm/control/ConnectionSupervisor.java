@@ -10,6 +10,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.ServiceInfo;
+import android.hardware.display.DisplayManager;
 import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
@@ -20,6 +21,7 @@ import android.os.IBinder;
 import android.os.Looper;
 import android.util.DisplayMetrics;
 import android.util.Log;
+import android.view.Display;
 
 import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
@@ -303,6 +305,7 @@ public class ConnectionSupervisor extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         startAsForeground();
         registerNetworkCallback();
+        registerDisplayListener();
 
         // The idle auto-exit is force-disabled here regardless of any stored
         // setting: the agent must never self-terminate.
@@ -333,6 +336,16 @@ public class ConnectionSupervisor extends Service {
         Log.i(TAG, "ConnectionSupervisor destroyed");
         instance = null;
         handler.removeCallbacksAndMessages(null);
+        if (displayListenerRegistered) {
+            try {
+                DisplayManager dm = (DisplayManager) getSystemService(Context.DISPLAY_SERVICE);
+                if (dm != null) {
+                    dm.unregisterDisplayListener(displayListener);
+                }
+            } catch (Exception ignored) {
+            }
+            displayListenerRegistered = false;
+        }
         if (connectivityManager != null && networkCallback != null) {
             try {
                 connectivityManager.unregisterNetworkCallback(networkCallback);
@@ -416,6 +429,57 @@ public class ConnectionSupervisor extends Service {
         Log.i(TAG, "scheduling reconnect #" + reconnectAttempt + " in " + delay + "ms");
         handler.removeCallbacks(reconnectRunnable);
         handler.postDelayed(reconnectRunnable, delay);
+    }
+
+    // Display changes (rotation) must refresh the screen metrics and tell the
+    // admin the new resolution even when no Activity is alive: the refresh
+    // used to run only from MainActivity.onCreate() or connect(), so a
+    // rotation mid-session left the capture at the stale size (the admin saw
+    // a stretched picture).
+    private boolean displayListenerRegistered;
+
+    private final DisplayManager.DisplayListener displayListener = new DisplayManager.DisplayListener() {
+        @Override
+        public void onDisplayAdded(int displayId) {
+        }
+
+        @Override
+        public void onDisplayRemoved(int displayId) {
+        }
+
+        @Override
+        public void onDisplayChanged(int displayId) {
+            if (displayId != Display.DEFAULT_DISPLAY) {
+                return;
+            }
+            // Debounce: a rotation fires several display events (size,
+            // density, state) within milliseconds.
+            handler.removeCallbacks(displayMetricsRunnable);
+            handler.postDelayed(displayMetricsRunnable, 300);
+        }
+    };
+
+    private final Runnable displayMetricsRunnable = new Runnable() {
+        @Override
+        public void run() {
+            applyScreenMetrics();
+            // Re-send "streamingVideoResolution" so the admin's canvas and
+            // gesture scale follow the new aspect ratio.
+            engine.notifyScreenResolution();
+        }
+    };
+
+    private void registerDisplayListener() {
+        if (displayListenerRegistered) {
+            return;
+        }
+        DisplayManager dm = (DisplayManager) getSystemService(Context.DISPLAY_SERVICE);
+        if (dm == null) {
+            return;
+        }
+        dm.registerDisplayListener(displayListener, null);
+        displayListenerRegistered = true;
+        Log.d(TAG, "display listener registered (rotation -> live metrics refresh)");
     }
 
     private void applyScreenMetrics() {

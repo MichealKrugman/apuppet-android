@@ -147,11 +147,23 @@ public class ScreenSharingService extends Service {
         String action = intent.getAction();
         Log.d(Const.LOG_TAG, "ScreenSharingService got command: " + action);
         if (action.equals(ACTION_SET_METRICS)) {
-            mScreenWidth = intent.getIntExtra(ATTR_SCREEN_WIDTH, 0);
-            mScreenHeight = intent.getIntExtra(ATTR_SCREEN_HEIGHT, 0);
-            mScreenDensity = intent.getIntExtra(ATTR_SCREEN_DENSITY, 0);
+            int newWidth = intent.getIntExtra(ATTR_SCREEN_WIDTH, 0);
+            int newHeight = intent.getIntExtra(ATTR_SCREEN_HEIGHT, 0);
+            int newDensity = intent.getIntExtra(ATTR_SCREEN_DENSITY, 0);
+            boolean resizing = (mMediaProjection != null && mVirtualDisplay != null)
+                    && (newWidth != mScreenWidth || newHeight != mScreenHeight || newDensity != mScreenDensity);
+            mScreenWidth = newWidth;
+            mScreenHeight = newHeight;
+            mScreenDensity = newDensity;
             Log.d(Const.LOG_TAG, "ScreenSharingService: width=" + mScreenWidth + ", height=" + mScreenHeight + ", density=" + mScreenDensity);
-
+            if (resizing) {
+                // Rotation while capturing: the virtual display and encoder
+                // were built for the old orientation, so the admin kept
+                // receiving 360x800 frames of a now-landscape screen (wrong
+                // aspect ratio). Rebuild the capture pipeline at the new size;
+                // the projection token is unchanged, so consent stays intact.
+                resizeCapture();
+            }
         } else if (action.equals(ACTION_CONFIGURE)) {
             configure(intent.getBooleanExtra(ATTR_AUDIO, false),
                     intent.getIntExtra(ATTR_FRAME_RATE, 0),
@@ -354,6 +366,100 @@ public class ScreenSharingService extends Service {
             stopScreenSharing(destroyMediaProjection);
         } catch (Exception e) {
             e.printStackTrace();
+        }
+    }
+
+    // Rebuild the capture pipeline at the current (rotated) screen metrics.
+    //
+    // Android 14 constraint (verified against AOSP
+    // MediaProjectionManagerService.MediaProjection.isValid(), 2026-10-22):
+    // ONE consent instance permits exactly ONE createVirtualDisplay ever --
+    // "Set if MediaProjection#createVirtualDisplay has been invoked
+    // previously (it should only be called once)". A second createVirtualDisplay
+    // throws SecurityException("Don't take multiple captures by invoking
+    // MediaProjection#createVirtualDisplay multiple times on the same
+    // instance"). So the display instance is kept and reconfigured instead:
+    // VirtualDisplay.resize() + VirtualDisplay.setSurface() are same-instance
+    // calls that do not re-enter createVirtualDisplay.
+    //
+    // mMediaProjection is kept throughout: this never re-prompts the user.
+    // The packetizer re-sends SPS/PPS with the first IDR of the new stream
+    // (I-frame interval is 1s), so the admin's decoder adopts the new
+    // resolution on its own.
+    private void resizeCapture() {
+        Log.i(Const.LOG_TAG, "ScreenSharingService: resizing capture to "
+                + mScreenWidth + "x" + mScreenHeight + " density=" + mScreenDensity);
+        MediaCodec oldCodec = mMediaCodec;
+        // Old surface stays bound until the new codec is ready and the swap
+        // succeeds, so a failure below leaves no dangling state.
+        try {
+            mPacketizer.stop();
+        } catch (Exception ignored) {
+        }
+        if (!initRecorder()) {
+            Log.e(Const.LOG_TAG, "ScreenSharingService: resize re-init failed; stopping capture");
+            try {
+                if (oldCodec != null) {
+                    oldCodec.stop();
+                    oldCodec.release();
+                }
+            } catch (Exception ignored) {
+            }
+            mMediaCodec = null;
+            try {
+                stopSharing(false);
+            } catch (Exception ignored) {
+            }
+            return;
+        }
+        try {
+            mVirtualDisplay.resize(mScreenWidth, mScreenHeight, mScreenDensity);
+            mVirtualDisplay.setSurface(mInputSurface);
+        } catch (Exception e) {
+            Log.e(Const.LOG_TAG, "ScreenSharingService: resize rejected by platform; stopping capture", e);
+            try {
+                mMediaCodec.stop();
+                mMediaCodec.release();
+            } catch (Exception ignored) {
+            }
+            mMediaCodec = null;
+            try {
+                if (oldCodec != null) {
+                    oldCodec.stop();
+                    oldCodec.release();
+                }
+            } catch (Exception ignored) {
+            }
+            try {
+                if (mVirtualDisplay != null) {
+                    mVirtualDisplay.release();
+                }
+            } catch (Exception ignored) {
+            }
+            mVirtualDisplay = null;
+            stopForeground(true);
+            return;
+        }
+        // Swap complete: the old surface is detached from the display, so the
+        // old codec can go.
+        try {
+            if (oldCodec != null) {
+                oldCodec.stop();
+                oldCodec.release();
+            }
+        } catch (Exception ignored) {
+        }
+        try {
+            mMediaCodec.start();
+            startSending();
+            Log.i(Const.LOG_TAG, "ScreenSharingService: resize complete ("
+                    + mScreenWidth + "x" + mScreenHeight + ")");
+        } catch (Exception e) {
+            Log.e(Const.LOG_TAG, "ScreenSharingService: resize start failed", e);
+            try {
+                stopSharing(false);
+            } catch (Exception ignored) {
+            }
         }
     }
 

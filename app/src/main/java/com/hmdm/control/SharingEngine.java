@@ -71,6 +71,12 @@ public abstract class SharingEngine {
 
     public abstract int getVideoPort();
 
+    // Re-announce the screen resolution to a connected admin (display change
+    // while sharing). No-op by default; engines with a control channel
+    // override this.
+    public void notifyScreenResolution() {
+    }
+
     public interface CompletionHandler {
         void onComplete(boolean success, String errorReason);
     }

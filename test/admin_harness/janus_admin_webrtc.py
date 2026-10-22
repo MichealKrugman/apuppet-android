@@ -375,8 +375,13 @@ async def main():
                             print("VIDEO track ended: %s after %d frames" %
                                   (type(e).__name__, vstats["frames"]), flush=True)
                             break
+                        prev_res = vstats.get("res")
                         vstats["frames"] += 1
                         vstats["res"] = (frame.width, frame.height)
+                        if prev_res and prev_res != (0, 0) and prev_res != vstats["res"]:
+                            print("VIDEO resolution changed: %dx%d -> %dx%d" %
+                                  (prev_res[0], prev_res[1], frame.width, frame.height),
+                                  flush=True)
                         if vstats["frames"] in (1, 30, 60, 120):
                             print("VIDEO frame %d: %dx%d" %
                                   (vstats["frames"], frame.width, frame.height),
